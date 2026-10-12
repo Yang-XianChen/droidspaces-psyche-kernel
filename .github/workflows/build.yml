@@ -85,12 +85,37 @@ jobs:
           curl -fsSL -o /tmp/02-cgroup-prefix.patch \
             "$BASE/02.fix_restore%20cgroup%20file%20prefix%20handling%20.patch"
           cd kernel
-          for p in /tmp/01-xt_qtaguid.patch /tmp/02-cgroup-prefix.patch; do
-            echo "### 预检 $p"
-            patch -p1 --dry-run < "$p"
-            echo "### 应用 $p"
-            patch -p1 < "$p"
-          done
+
+          # 逐个补丁判断:目标文件不存在 -> 该驱动已从树中移除,补丁不适用,跳过;
+          #               可正向应用 -> 应用;
+          #               只能反向应用 -> 之前已应用,跳过;
+          #               目标存在但推不进去 -> 真失败,中止。
+          apply_patch() {
+            local p="$1" target
+            target=$(grep -m1 '^--- a/' "$p" | sed 's|^--- a/||')
+            if [ -z "$target" ]; then
+              echo "::error::无法从 $(basename "$p") 解析目标文件"
+              return 1
+            fi
+            if [ ! -e "$target" ]; then
+              echo "::warning::跳过 $(basename "$p"):目标 $target 不在该内核树中(该驱动已被移除,补丁不适用)"
+              return 0
+            fi
+            if patch -p1 --dry-run --forward < "$p" > /tmp/patch-dry.log 2>&1; then
+              patch -p1 --forward < "$p"
+              echo "已应用 $(basename "$p")"
+            elif patch -p1 --dry-run --reverse --forward < "$p" > /dev/null 2>&1; then
+              echo "已应用过 $(basename "$p"),跳过"
+            else
+              echo "::error::$(basename "$p") 无法应用(目标 $target 存在但内容不匹配)"
+              cat /tmp/patch-dry.log
+              return 1
+            fi
+          }
+
+          apply_patch /tmp/01-xt_qtaguid.patch
+          apply_patch /tmp/02-cgroup-prefix.patch
+          echo "补丁阶段完成"
 
       - name: 合并 defconfig 并注入 Droidspaces 配置
         run: |

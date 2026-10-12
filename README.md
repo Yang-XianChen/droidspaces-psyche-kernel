@@ -178,5 +178,8 @@ systemd 258(2025-09)起同时依赖这两个且不再回退,所以:
    与 device tree 原本的 `kona-perf_defconfig` + `debugfs.config` + `sm8250-common.config` + `psyche.config`
    合并成一个 `psyche_ds_defconfig` 使用。核心是打开原本被**显式关闭**的 `CONFIG_PID_NS`,
    并补上 `SYSVIPC` / `POSIX_MQUEUE` / `IPC_NS`(前两者是 `IPC_NS` 的 Kconfig 前置)。
-2. **打两个官方 non-GKI 补丁**:`xt_qtaguid` 内核 panic 修复、cgroup 文件前缀处理修复。
+2. **打官方 non-GKI 补丁**。这里有个实测发现:
+   - `02.fix_restore cgroup file prefix handling` → 目标是 `kernel/cgroup/cgroup.c`,**干净应用**(hunk 偏移 455 行)。
+   - `01.fix_kernel_panic_in_xt_qtaguid` → 目标是 `net/netfilter/xt_qtaguid.c`,**该驱动在这棵树里已被移除**,
+     补丁不适用。工作流会检测到目标缺失后**跳过并给出警告**,不会因此失败。
 3. **编译后只取 `Image`** 打进 AnyKernel3,不动 dtb / dtbo / vendor_boot / vendor 分区。
