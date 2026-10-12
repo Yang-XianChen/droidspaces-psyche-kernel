@@ -49,20 +49,32 @@ jobs:
       - name: 获取内核源码
         run: |
           set -eux
-          git init kernel
-          cd kernel
-          git remote add origin "https://github.com/${{ inputs.kernel_repo }}.git"
-          git config --global --add safe.directory "$PWD"
+          REPO="${{ inputs.kernel_repo }}"
           REF="${{ inputs.kernel_ref }}"
-          # 分支名走浅克隆;提交号浅取失败时回退到完整 fetch
-          if git fetch --depth 1 origin "$REF"; then
-            git checkout --detach FETCH_HEAD
+          SHA_SHORT="$REF"
+
+          # 分支名 -> 浅克隆(快)
+          # 其他(提交 SHA / tag)-> codeload tarball
+          #   Rocky 的内核分支会被 rebase/force-push,设备上跑的那个提交往往已经不是
+          #   任何分支的祖先,此时 git fetch <sha> 会报 "couldn't find remote ref",
+          #   但 codeload 仍能按 SHA 打包,所以走 tarball。
+          if git ls-remote --exit-code --heads "https://github.com/${REPO}.git" "$REF" >/dev/null 2>&1; then
+            echo "==> '$REF' 是分支,浅克隆"
+            git clone --depth 1 --branch "$REF" "https://github.com/${REPO}.git" kernel
+            SHA_SHORT=$(git -C kernel rev-parse --short=12 HEAD)
+            git -C kernel log --oneline -1
           else
-            git fetch origin --tags
-            git checkout --detach "$REF"
+            echo "==> '$REF' 不是分支,按提交 SHA 走 codeload tarball"
+            rm -rf kernel
+            mkdir -p kernel
+            curl -fsSL "https://codeload.github.com/${REPO}/tar.gz/${REF}" \
+              | tar -xz --strip-components=1 -C kernel
+            test -f kernel/Makefile
+            echo "kernel source extracted: $(find kernel -name '*.c' | wc -l) 个 .c 文件"
           fi
-          git log --oneline -1
-          echo "KERNEL_SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+
+          echo "KERNEL_SHA=${SHA_SHORT}" >> "$GITHUB_ENV"
+          echo "解析到的内核标识: ${SHA_SHORT}"
 
       - name: 安装工具链 (ZyCromerZ Clang 16)
         run: |
