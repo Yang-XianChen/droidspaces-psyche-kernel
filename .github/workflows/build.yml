@@ -1,0 +1,234 @@
+name: Build Droidspaces Kernel (Xiaomi 12X / psyche)
+
+# 用途:从 crDroid 12 (Android 16) 所用的内核源码出发,注入 Droidspaces 所需的
+# non-GKI 内核配置 + 官方补丁,编译出可直接刷入的 AnyKernel3 卡刷包。
+#
+# 关键前提(已在源码层面核实):
+#   * 该内核树全部驱动 =y 编译进内核,defconfig 中 =m 的条目为 0,即不产生 .ko 模块。
+#     因此改配置不会引发 CONFIG_MODVERSIONS 的符号 CRC 不匹配,/vendor 不需要跟着换。
+#   * BOARD_INCLUDE_DTB_IN_BOOTIMG := true,dtb 在 boot.img 里。本流程只替换 boot 的
+#     kernel,保留 ROM 原有的 dtb / dtbo,避免 DTS 漂移与 dtbo 已知问题。
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: '内核源码仓库 (owner/repo)'
+        required: true
+        default: 'Rocky7842/android_kernel_xiaomi_sm8250'
+      kernel_ref:
+        description: '分支名或提交号。必须用 -ksu 分支,否则刷入后丢失 root!'
+        required: true
+        default: 'lineage-23.2-ksu'
+      publish_release:
+        description: '构建成功后发布到 Releases'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout(本仓库:工作流 + 配置 + 打包脚本)
+        uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl device-tree-compiler flex gawk \
+            git gnupg gperf imagemagick kmod libelf-dev libncurses-dev libssl-dev \
+            libxml2 libxml2-utils lzop pngcrush python3 rsync schedtool \
+            squashfs-tools xsltproc zip zlib1g-dev
+
+      - name: 获取内核源码
+        run: |
+          set -eux
+          git init kernel
+          cd kernel
+          git remote add origin "https://github.com/${{ inputs.kernel_repo }}.git"
+          git config --global --add safe.directory "$PWD"
+          REF="${{ inputs.kernel_ref }}"
+          # 分支名走浅克隆;提交号浅取失败时回退到完整 fetch
+          if git fetch --depth 1 origin "$REF"; then
+            git checkout --detach FETCH_HEAD
+          else
+            git fetch origin --tags
+            git checkout --detach "$REF"
+          fi
+          git log --oneline -1
+          echo "KERNEL_SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+
+      - name: 安装工具链 (ZyCromerZ Clang 16)
+        run: |
+          set -eux
+          mkdir -p "$HOME/zyc-clang"
+          cd "$HOME/zyc-clang"
+          curl -fsSL -o clang.tar.gz \
+            "https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20260510-release/Clang-16.0.6-20260510.tar.gz"
+          tar -xzf clang.tar.gz
+          rm -f clang.tar.gz
+          test -x "$HOME/zyc-clang/bin/clang"
+          echo "$HOME/zyc-clang/bin" >> "$GITHUB_PATH"
+
+      - name: 应用 Droidspaces 官方 non-GKI 内核补丁
+        run: |
+          set -eux
+          BASE="https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/non-GKI"
+          curl -fsSL -o /tmp/01-xt_qtaguid.patch \
+            "$BASE/01.fix_kernel_panic_in_xt_qtaguid.patch"
+          curl -fsSL -o /tmp/02-cgroup-prefix.patch \
+            "$BASE/02.fix_restore%20cgroup%20file%20prefix%20handling%20.patch"
+          cd kernel
+          for p in /tmp/01-xt_qtaguid.patch /tmp/02-cgroup-prefix.patch; do
+            echo "### 预检 $p"
+            patch -p1 --dry-run < "$p"
+            echo "### 应用 $p"
+            patch -p1 < "$p"
+          done
+
+      - name: 合并 defconfig 并注入 Droidspaces 配置
+        run: |
+          set -eux
+          cd kernel
+          C=arch/arm64/configs
+          # device tree 的 TARGET_KERNEL_CONFIG 是"多文件按序拼接",这里等价复现,
+          # 最后接上 Droidspaces 片段 —— 顺序在后,可覆盖原有的 "# CONFIG_PID_NS is not set"
+          cat "$C/vendor/kona-perf_defconfig" \
+              "$C/vendor/debugfs.config" \
+              "$C/vendor/xiaomi/sm8250-common.config" \
+              "$C/vendor/xiaomi/psyche.config" \
+              "$GITHUB_WORKSPACE/config/psyche-droidspaces.config" \
+              > "$C/psyche_ds_defconfig"
+          echo "合并后行数: $(wc -l < "$C/psyche_ds_defconfig")"
+          echo "其中 CONFIG_ 条目: $(grep -c '^CONFIG_' "$C/psyche_ds_defconfig")"
+
+      - name: 生成 .config 并校验关键项
+        run: |
+          set -euxo pipefail
+          cd kernel
+
+          MAKE_OPTS=(-j"$(nproc)" O=out ARCH=arm64 SUBARCH=arm64
+                     LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang"
+                     CROSS_COMPILE=aarch64-linux-gnu-
+                     CROSS_COMPILE_ARM32=arm-linux-gnueabi-)
+
+          make "${MAKE_OPTS[@]}" psyche_ds_defconfig
+          make "${MAKE_OPTS[@]}" olddefconfig
+
+          fail=0
+
+          echo "========== A. 容器启动关键项(必须 =y) =========="
+          for s in NAMESPACES UTS_NS PID_NS IPC_NS SYSVIPC POSIX_MQUEUE \
+                   SECCOMP SECCOMP_FILTER CGROUPS DEVTMPFS NET_NS; do
+            if grep -qx "CONFIG_${s}=y" out/.config; then
+              echo "  [ OK ] CONFIG_${s}=y"
+            else
+              echo "  [FAIL] CONFIG_${s} 不是 =y"
+              fail=1
+            fi
+          done
+
+          echo "========== B. 功能性配置(缺失不阻断启动) =========="
+          for s in CGROUP_DEVICE CGROUP_SCHED FAIR_GROUP_SCHED CGROUP_FREEZER \
+                   CGROUP_NET_PRIO MEMCG CGROUP_CPUACCT CGROUP_PIDS USER_NS \
+                   BLK_DEV_LOOP EXT4_FS OVERLAY_FS TMPFS_XATTR TMPFS_POSIX_ACL \
+                   VETH BRIDGE NETFILTER BRIDGE_NETFILTER NF_CONNTRACK \
+                   IP_NF_IPTABLES IP_NF_FILTER NF_NAT NF_TABLES \
+                   IP_NF_TARGET_MASQUERADE NETFILTER_XT_TARGET_TCPMSS \
+                   NETFILTER_XT_MATCH_ADDRTYPE NF_NAT_REDIRECT \
+                   IP_ADVANCED_ROUTER IP_MULTIPLE_TABLES FUSE_FS TUN MACVLAN; do
+            if grep -qx "CONFIG_${s}=y" out/.config; then
+              echo "  [ OK ] CONFIG_${s}=y"
+            else
+              echo "  [ -- ] CONFIG_${s} 未启用"
+            fi
+          done
+
+          echo "========== C. 必须关闭的项 =========="
+          for s in ANDROID_PARANOID_NETWORK PERF_HUMANTASK; do
+            if grep -qx "CONFIG_${s}=y" out/.config; then
+              echo "  [FAIL] CONFIG_${s}=y 必须关闭"
+              fail=1
+            else
+              echo "  [ OK ] ${s} 已关闭"
+            fi
+          done
+
+          echo "========== D. KernelSU(保住 root) =========="
+          if [ -f drivers/kernelsu/Kconfig ]; then
+            if grep -qx "CONFIG_KSU=y" out/.config; then
+              echo "  [ OK ] CONFIG_KSU=y —— 刷入后 KernelSU root 保留"
+            else
+              echo "  [FAIL] 该分支带 KernelSU 源码,但 CONFIG_KSU 未启用"
+              fail=1
+            fi
+          else
+            echo "  [WARN] 该分支不含 drivers/kernelsu —— 刷入后会丢失 root!"
+            echo "         请把 kernel_ref 改成 lineage-23.2-ksu 重新构建。"
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::关键内核配置未生效,已中止(避免刷入一个起不了容器的内核)"
+            exit 1
+          fi
+          echo "全部关键配置校验通过 ✅"
+
+      - name: 编译内核
+        run: |
+          set -eux
+          cd kernel
+          make -j"$(nproc)" O=out ARCH=arm64 SUBARCH=arm64 \
+               LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" \
+               CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          ls -la out/arch/arm64/boot/Image
+          file out/arch/arm64/boot/Image || true
+
+      - name: 打包 AnyKernel3 卡刷包
+        run: |
+          set -eux
+          # 固定到已验证的 AnyKernel3 提交
+          AK3_SHA=020dfeccf9d7e962a48400fc94d3e451df92eead
+          mkdir -p ak3
+          curl -fsSL "https://github.com/osm0sis/AnyKernel3/archive/${AK3_SHA}.tar.gz" \
+            | tar -xz --strip-components=1 -C ak3
+          # 覆盖为本机型的 anykernel.sh
+          cp anykernel/anykernel.sh ak3/anykernel.sh
+          # 注意:这里故意【不放 dtb】—— 保留 ROM 原有 dtb/dtbo,只替换 boot 里的 kernel
+          cp kernel/out/arch/arm64/boot/Image ak3/Image
+          ls -la ak3/Image
+          ZIP="Droidspaces-psyche-${KERNEL_SHA}.zip"
+          ( cd ak3 && zip -r9 "../${ZIP}" . -x '*.git*' > /dev/null )
+          rm -rf kernel
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          unzip -l "$ZIP" | head -20
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Droidspaces-psyche-${{ env.KERNEL_SHA }}
+          path: ${{ env.ZIP }}
+          if-no-files-found: error
+
+      - name: 发布 Release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: droidspaces-psyche-${{ env.KERNEL_SHA }}-${{ github.run_number }}
+          name: "Droidspaces kernel for Xiaomi 12X (psyche) — ${{ env.KERNEL_SHA }}"
+          body: |
+            Droidspaces-enabled kernel for **Xiaomi 12X (psyche)**, crDroid 12 / Android 16.
+
+            - Kernel source: `${{ inputs.kernel_repo }}` @ `${{ inputs.kernel_ref }}`
+            - Resolved commit: `${{ env.KERNEL_SHA }}`
+            - Includes Droidspaces non-GKI config + official kernel patches
+            - Replaces the **kernel in the boot image only**; keeps your ROM's dtb, dtbo and vendor_boot
+            - Flash with any AnyKernel3-compatible flasher (e.g. KernelFlasher) while rooted
+          files: ${{ env.ZIP }}
+          draft: false
+          prerelease: false
